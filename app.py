@@ -1,18 +1,19 @@
-# app.py - Vercel-ready version
+# app.py - Vercel-ready version with Rainforest API integration
 import os
+import time
+import uuid
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
-from bs4 import BeautifulSoup
-import re
-import time
-import random
-from typing import List, Dict, Optional
-from urllib.parse import quote_plus
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import uuid
+
+# Load environment variables - try python-dotenv, but continue if not available for Vercel
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("Loaded environment variables from .env file")
+except ImportError:
+    print("python-dotenv not installed, using environment variables directly")
 
 app = Flask(__name__)
 CORS(app)
@@ -32,6 +33,10 @@ class EmailService:
             return False
             
         try:
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            import smtplib
+            
             msg = MIMEMultipart('alternative')
             msg['Subject'] = f"Your AI-Researched Top 10 {list_data.get('category', 'Products')} List"
             msg['From'] = self.email_user
@@ -67,6 +72,9 @@ class EmailService:
             return False
             
         try:
+            from email.mime.text import MIMEText
+            import smtplib
+            
             msg = MIMEText(f"""
 New Top 10 List Generated!
 
@@ -91,17 +99,75 @@ This user requested a Top 10 list and provided their email address.
             print(f"Lead capture error: {e}")
             return False
 
-class AmazonProductResearcher:
+class RainforestApiClient:
     def __init__(self, affiliate_id="ai4u0c-20"):
         self.affiliate_id = affiliate_id
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        self.api_key = os.environ.get('RAINFOREST_API_KEY')
+        
+        if not self.api_key:
+            raise ValueError("Rainforest API key not found in environment variables")
+            
+        self.base_url = "https://api.rainforestapi.com/request"
+    
+    def search_products(self, search_term, max_results=10):
+        """Search Amazon products using Rainforest API"""
+        params = {
+            "api_key": self.api_key,
+            "type": "search",
+            "amazon_domain": "amazon.com",
+            "search_term": search_term,
+            "sort_by": "featured"
         }
         
-    def intelligent_category_analysis(self, prompt: str) -> Dict[str, str]:
-        """AI-powered category analysis for unlimited product types"""
+        print(f"Searching Rainforest API for: {search_term}")
+        
+        try:
+            response = requests.get(self.base_url, params=params)
+            response.raise_for_status()  # Raise exception for HTTP errors
+            
+            data = response.json()
+            
+            if "search_results" not in data:
+                raise ValueError(f"Invalid response from Rainforest API: {data.get('message', 'No search results found')}")
+                
+            products = []
+            for item in data["search_results"][:max_results]:
+                # Skip items without required data
+                if not item.get("asin") or not item.get("title"):
+                    continue
+                    
+                product = {
+                    "asin": item.get("asin"),
+                    "title": item.get("title"),
+                    "price": item.get("price", {}).get("raw", "Price not available"),
+                    "rating": item.get("rating", 0),
+                    "affiliate_link": f"https://www.amazon.com/dp/{item.get('asin')}?tag={self.affiliate_id}",
+                    "image_url": item.get("image", ""),
+                    "description": item.get("title"),  # Use title as fallback description
+                    "amazon_url": f"https://www.amazon.com/dp/{item.get('asin')}"
+                }
+                products.append(product)
+                
+            print(f"Found {len(products)} products for {search_term}")
+            return products
+            
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(f"Failed to connect to Rainforest API: {str(e)}")
+        except (ValueError, KeyError) as e:
+            raise ValueError(f"Error processing Rainforest API response: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Unexpected error with Rainforest API: {str(e)}")
+
+class ProductListGenerator:
+    def __init__(self):
+        try:
+            self.api_client = RainforestApiClient()
+        except ValueError as e:
+            # Re-raise with more specific message for initialization
+            raise ValueError(f"Failed to initialize Rainforest API client: {str(e)}")
+    
+    def intelligent_category_analysis(self, prompt):
+        """Determine the best search terms based on prompt"""
         prompt_lower = prompt.lower()
         
         # Food & Grocery
@@ -123,84 +189,19 @@ class AmazonProductResearcher:
         # Default
         return {'category': 'general', 'search_terms': prompt}
     
-    def get_curated_products(self, search_query: str) -> List[Dict]:
-        """Return curated products with real ASINs"""
-        
-        # Real Amazon ASINs for different categories
-        products_db = {
-            'chips': [
-                {'asin': 'B000EML5QG', 'title': 'Lays Classic Potato Chips Family Size', 'price': '$4.98'},
-                {'asin': 'B00KJOJKDU', 'title': 'Pringles Original Potato Crisps', 'price': '$1.50'},
-                {'asin': 'B0742NZ7QS', 'title': 'Kettle Brand Sea Salt Potato Chips', 'price': '$4.99'},
-                {'asin': 'B07B2BYRPX', 'title': 'Cheetos Crunchy Cheese Flavored Snacks', 'price': '$4.28'},
-                {'asin': 'B000LQORDE', 'title': 'Doritos Nacho Cheese Tortilla Chips', 'price': '$4.48'},
-            ],
-            'baby': [
-                {'asin': 'B07H8QZBZ5', 'title': 'Pampers Baby Dry Overnight Diapers', 'price': '$47.99'},
-                {'asin': 'B07W7TDNBX', 'title': 'Huggies Little Snugglers Baby Diapers', 'price': '$51.99'},
-                {'asin': 'B077Y64GQ2', 'title': 'The Honest Company Diapers', 'price': '$39.99'},
-                {'asin': 'B01KBRP2T0', 'title': 'Seventh Generation Baby Diapers', 'price': '$44.99'},
-                {'asin': 'B08LTR6Q4R', 'title': 'Bambo Nature Eco-Friendly Diapers', 'price': '$52.99'},
-            ],
-            'smartphone': [
-                {'asin': 'B0CMDRCZBZ', 'title': 'Apple iPhone 15 Pro Max (256GB)', 'price': '$1,299.00'},
-                {'asin': 'B0C63ZBTXT', 'title': 'Samsung Galaxy S24 Ultra (512GB)', 'price': '$1,419.99'},
-                {'asin': 'B0CHX8Z5ZZ', 'title': 'Google Pixel 8 Pro (128GB)', 'price': '$999.00'},
-                {'asin': 'B0BQR7TFDP', 'title': 'OnePlus 11 5G (256GB)', 'price': '$799.00'},
-                {'asin': 'B0B2S5C9K8', 'title': 'Samsung Galaxy S23 (256GB)', 'price': '$859.99'},
-            ],
-            'laptop': [
-                {'asin': 'B0CX23V2ZK', 'title': 'Apple MacBook Air 15-inch M3 Chip', 'price': '$1,299.00'},
-                {'asin': 'B0BS4BP8FB', 'title': 'Dell XPS 13 (Intel i7, 16GB)', 'price': '$1,199.99'},
-                {'asin': 'B0CCF1L62Z', 'title': 'ASUS ROG Strix G16 Gaming Laptop', 'price': '$1,399.00'},
-                {'asin': 'B0C6GB5K3R', 'title': 'HP Pavilion 15.6" Laptop', 'price': '$699.99'},
-                {'asin': 'B0BYG5Q8XD', 'title': 'Lenovo ThinkPad E15 Business Laptop', 'price': '$849.00'},
-            ],
-            'skincare': [
-                {'asin': 'B00TTD9BRC', 'title': 'CeraVe Daily Facial Moisturizing Lotion', 'price': '$13.99'},
-                {'asin': 'B00PGGGM1O', 'title': 'Neutrogena Hydrating Foaming Cleanser', 'price': '$6.97'},
-                {'asin': 'B004EPZ5GQ', 'title': 'Olay Regenerist Micro-Sculpting Cream', 'price': '$28.99'},
-                {'asin': 'B075QYX23K', 'title': 'The Ordinary Hyaluronic Acid 2% + B5', 'price': '$7.90'},
-                {'asin': 'B08MQWCJF3', 'title': 'La Roche-Posay Toleriane Double Repair', 'price': '$19.99'},
-            ]
-        }
-        
-        # Find matching category
-        query_lower = search_query.lower()
-        for category, products in products_db.items():
-            if category in query_lower or any(word in query_lower for word in category.split()):
-                return self.format_products(products)
-        
-        # Default to smartphones if no match
-        return self.format_products(products_db['smartphone'])
-    
-    def format_products(self, products: List[Dict]) -> List[Dict]:
-        """Format products with proper structure"""
-        formatted = []
-        for i, product in enumerate(products):
-            formatted.append({
-                'asin': product['asin'],
-                'title': product['title'],
-                'price': product['price'],
-                'rating': round(4.0 + random.uniform(0, 1), 1),
-                'affiliate_link': f"https://www.amazon.com/dp/{product['asin']}?tag={self.affiliate_id}",
-                'image_url': f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN={product['asin']}&Format=_SL250_&ID=AsinImage&MarketPlace=US&ServiceVersion=20070822&WS=1&tag={self.affiliate_id}",
-                'description': f"Highly rated {product['title']} with excellent customer reviews and fast shipping.",
-                'amazon_url': f"https://www.amazon.com/dp/{product['asin']}"
-            })
-        return formatted
-
-class ProductListGenerator:
-    def __init__(self):
-        self.researcher = AmazonProductResearcher()
-    
-    def generate_top10_list(self, prompt: str) -> Dict:
-        """Generate a complete Top 10 list"""
+    def generate_top10_list(self, prompt):
+        """Generate a complete Top 10 list using Rainforest API"""
         try:
-            category_info = self.researcher.intelligent_category_analysis(prompt)
-            products = self.researcher.get_curated_products(category_info['search_terms'])
+            category_info = self.intelligent_category_analysis(prompt)
+            products = self.api_client.search_products(category_info['search_terms'], max_results=10)
             
-            # Ensure exactly 10 products
+            if not products:
+                return {
+                    'success': False,
+                    'error': f"No products found for '{prompt}'. Please try a different search term."
+                }
+            
+            # Ensure we have up to 10 products (but could be fewer if API returns fewer)
             products = products[:10]
             
             list_title = f"Top 10 {prompt.title()} - AI-Researched & Endorsed 2025"
@@ -213,24 +214,35 @@ class ProductListGenerator:
                 'category': category_info['category'],
                 'products': products,
                 'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'affiliate_id': self.researcher.affiliate_id
+                'affiliate_id': self.api_client.affiliate_id
             }
             
-        except Exception as e:
+        except ValueError as e:
             return {'success': False, 'error': str(e)}
+        except ConnectionError as e:
+            return {'success': False, 'error': f"Connection error: {str(e)}"}
+        except Exception as e:
+            return {'success': False, 'error': f"Failed to generate list: {str(e)}"}
 
 # API Routes
 @app.route('/api/generate-list', methods=['POST'])
 def generate_list():
+    print(f"Received request at /api/generate-list with method {request.method}")
     try:
         data = request.json
+        print(f"Request data: {json.dumps(data)}")
+        
         prompt = data.get('prompt', '').strip()
         user_email = data.get('email', '').strip()
         
         if not prompt:
             return jsonify({'success': False, 'error': 'Prompt is required'}), 400
         
-        generator = ProductListGenerator()
+        try:
+            generator = ProductListGenerator()
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+            
         result = generator.generate_top10_list(prompt)
         
         if result['success']:
@@ -249,24 +261,93 @@ def generate_list():
         return jsonify(result)
         
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        error_message = str(e)
+        print(f"Error in generate_list: {error_message}")
+        return jsonify({'success': False, 'error': error_message}), 500
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
+    api_key = os.environ.get('RAINFOREST_API_KEY', '')
+    if not api_key:
+        return jsonify({
+            'status': 'warning',
+            'message': 'AI4U Top 10 Lists API v2.0 - Rainforest API key not configured',
+            'affiliate_id': 'ai4u0c-20'
+        }), 200
+    
     return jsonify({
         'status': 'healthy',
-        'message': 'AI4U Top 10 Lists API v2.0',
+        'message': 'AI4U Top 10 Lists API v2.0 - Rainforest API configured',
         'affiliate_id': 'ai4u0c-20'
     })
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({
-        'message': 'AI4U Top 10 Lists Backend API',
-        'version': '2.0.0',
-        'endpoints': ['/api/generate-list', '/api/health']
-    })
+    return "AI4U Top 10 Backend is running!"
+
+# Test route to verify API connection
+@app.route('/test', methods=['GET'])
+def test_page():
+    return '''
+    <html>
+    <head>
+        <title>AI4U API Test</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; }
+            input[type="text"] { width: 100%; padding: 8px; }
+            button { background: #4CAF50; color: white; padding: 10px 15px; border: none; cursor: pointer; }
+            pre { background: #f4f4f4; padding: 15px; overflow: auto; }
+        </style>
+    </head>
+    <body>
+        <h1>AI4U Top 10 API Test</h1>
+        <div class="form-group">
+            <label for="prompt">Search Term:</label>
+            <input type="text" id="prompt" value="vitamins" />
+        </div>
+        <div class="form-group">
+            <label for="email">Email (optional):</label>
+            <input type="text" id="email" value="" />
+        </div>
+        <button onclick="testAPI()">Test API</button>
+        <h2>Results:</h2>
+        <pre id="results">Results will appear here...</pre>
+
+        <script>
+            async function testAPI() {
+                const prompt = document.getElementById('prompt').value;
+                const email = document.getElementById('email').value;
+                const resultsElement = document.getElementById('results');
+                
+                resultsElement.textContent = 'Loading...';
+                
+                try {
+                    const response = await fetch('/api/generate-list', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            prompt: prompt,
+                            email: email
+                        })
+                    });
+                    
+                    const data = await response.json();
+                    resultsElement.textContent = JSON.stringify(data, null, 2);
+                } catch (error) {
+                    resultsElement.textContent = 'Error: ' + error.message;
+                }
+            }
+        </script>
+    </body>
+    </html>
+    '''
 
 # Vercel needs this
 if __name__ == '__main__':
-    app.run(debug=False)
+    print("Starting AI4U Top 10 Backend with Rainforest API integration")
+    print(f"API Key configured: {'Yes' if os.environ.get('RAINFOREST_API_KEY') else 'No'}")
+    app.run(debug=True)
