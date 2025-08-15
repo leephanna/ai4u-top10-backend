@@ -1,274 +1,309 @@
-import os
-import re
-import time
-import json
-import uuid
-import logging
-from typing import Dict, List, Optional
-
-import requests
+# app.py — Vercel-ready Flask backend with Rainforest API + optional Gmail email send
+import os, time, uuid, json, requests, smtplib, ssl
+from urllib.parse import urlparse
+from email.message import EmailMessage
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from dotenv import load_dotenv
 
-# ---------------------------
-# Boot / Config
-# ---------------------------
-load_dotenv()  # no-op on Vercel, works locally
+# Try to load .env locally; on Vercel we rely on project env vars
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app)
 
-# Logging (Heroku/Vercel friendly)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("ai4u-backend")
-
-# Env (required)
-RAINFOREST_API_KEY = os.getenv("RAINFOREST_API_KEY", "")
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-FROM_EMAIL = os.getenv("EMAIL_USER", "") or os.getenv("FROM_EMAIL", "")  # supports your existing var
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "")
-AFFILIATE_ID = os.getenv("AFFILIATE_ID", "ai4u0c-20")  # your tag default
-
-# Hard caps / timeouts
-REQ_TIMEOUT = 15  # seconds
-MAX_PRODUCTS = 10
-
-# Basic email validation
-EMAIL_RE = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.I)
-
-# ---------------------------
-# Utils
-# ---------------------------
-
-def safe_email(s: str) -> bool:
-    return bool(s and EMAIL_RE.match(s))
-
-def rainforests_search(search_term: str) -> List[Dict]:
-    """Search RainforestAPI. Returns a simplified product list."""
-    if not RAINFOREST_API_KEY:
-        raise RuntimeError("Rainforest API key missing on server")
-
-    params = {
-        "api_key": RAINFOREST_API_KEY,
-        "type": "search",
-        "amazon_domain": "amazon.com",
-        "search_term": search_term,
-        "sort_by": "featured",
-    }
-
-    url = "https://api.rainforestapi.com/request"
-    log.info("Rainforest request: %s", params)
-
-    r = requests.get(url, params=params, timeout=REQ_TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"Rainforest HTTP {r.status_code}: {r.text[:200]}")
-
-    data = r.json()
-    results = data.get("search_results", []) or []
-    products: List[Dict] = []
-
-    for p in results[:MAX_PRODUCTS]:
-        asin = p.get("asin")
-        if not asin:
-            continue
-        title = p.get("title", "")
-        price = (p.get("price", {}) or {}).get("raw", "")
-        rating = p.get("rating", 0)
-        image = p.get("image") or ""
-        snippet = p.get("snippet") or ""
-
-        # affiliate link
-        affiliate = f"https://www.amazon.com/dp/{asin}?tag={AFFILIATE_ID}"
-
-        products.append({
-            "asin": asin,
-            "title": title,
-            "price": price,
-            "rating": rating,
-            "image": image,
-            "snippet": snippet,
-            "affiliate_link": affiliate,
-            "amazon_url": f"https://www.amazon.com/dp/{asin}",
-        })
-
-    if not products:
-        raise RuntimeError("No products found for that query")
-
-    return products
-
-def render_email_html(title: str, products: List[Dict]) -> str:
-    """Very lightweight inline HTML email."""
-    rows = []
-    for i, p in enumerate(products, start=1):
-        rows.append(f"""
-        <tr>
-          <td style="padding:16px 0;border-bottom:1px solid #eee;">
-            <div style="font:700 16px/1.3 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial">
-              {i}. {p.get('title','')}
-            </div>
-            <div style="margin:8px 0">
-              <img src="{p.get('image','')}" alt="" width="220" style="border-radius:8px;display:block"/>
-            </div>
-            <div style="color:#666;font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial">
-              ASIN: {p.get('asin','')} &nbsp;&nbsp; Price: {p.get('price','')} &nbsp;&nbsp; Rating: {p.get('rating',0)}
-            </div>
-            <div style="margin:10px 0">
-              <a href="{p.get('affiliate_link','')}" target="_blank"
-                 style="background:#6C5CE7;color:#fff;text-decoration:none;padding:10px 14px;border-radius:8px;display:inline-block">
-                 View on Amazon
-              </a>
-            </div>
-          </td>
-        </tr>
-        """)
-
-    body = "\n".join(rows)
-    return f"""
-<!doctype html>
-<html>
-  <body style="margin:0;padding:24px;background:#fafafa;">
-    <center>
-      <table width="640" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:14px;padding:24px">
-        <tr>
-          <td style="font:800 22px/1.2 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial">
-            {title}
-          </td>
-        </tr>
-        <tr><td style="height:12px"></td></tr>
-        <tr>
-          <td style="color:#777;font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial">
-            Here’s your AI-researched Top 10 list.
-          </td>
-        </tr>
-        <tr><td style="height:16px"></td></tr>
-        {body}
-      </table>
-      <div style="color:#999;font:12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;margin-top:16px">
-        © AI4U — Automated Top 10 Lists
-      </div>
-    </center>
-  </body>
-</html>
-    """.strip()
-
-def send_with_resend(to_email: str, subject: str, html_body: str) -> Dict:
-    """Send email through Resend API with simple retry."""
-    if not (RESEND_API_KEY and FROM_EMAIL):
-        raise RuntimeError("Email sending not configured (RESEND_API_KEY/FROM_EMAIL)")
-
-    url = "https://api.resend.com/emails"
-    headers = {
-        "Authorization": f"Bearer {RESEND_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "from": FROM_EMAIL,       # e.g. "AI4U Top 10 <top10@ai4utech.com>"
-        "to": [to_email],
-        "subject": subject,
-        "html": html_body,
-    }
-
-    # small retry for transient errors
-    for attempt in range(1, 4):
-        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=REQ_TIMEOUT)
-        if resp.status_code in (200, 202):
-            return resp.json()
-        # transient? try again
-        if resp.status_code >= 500:
-            time.sleep(0.8 * attempt)
-            continue
-        # not transient
-        raise RuntimeError(f"Resend error {resp.status_code}: {resp.text[:200]}")
-
-    raise RuntimeError("Resend failed after retries")
-
-def notify_admin_lead(query: str, user_email: str, req_id: str) -> None:
-    """Fire-and-forget admin notification (best-effort)."""
-    if not (RESEND_API_KEY and ADMIN_EMAIL and FROM_EMAIL):
-        return
+# ---------- Email helpers (Option A: Gmail SMTP + App Password) ----------
+def _absolutize(url: str) -> str:
+    """Return absolute URL; if already absolute, return as-is."""
     try:
-        html = f"""
-        <p>New lead captured.</p>
-        <p><b>User Email:</b> {user_email}</p>
-        <p><b>Search Query:</b> {query}</p>
-        <p><b>Request ID:</b> {req_id}</p>
-        <p><small>Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}</small></p>
-        """
-        send_with_resend(ADMIN_EMAIL, "Top 10 — New Lead Captured", html)
-    except Exception as e:
-        log.warning("Admin notify failed: %s", e)
+        u = urlparse(url or "")
+        if u.scheme and u.netloc:
+            return url
+    except Exception:
+        pass
+    return url  # your links are already absolute; keep as safety
 
-# ---------------------------
-# HTTP
-# ---------------------------
+def send_email_html(to_email: str, subject: str, html_body: str, bcc: str | None = None) -> dict:
+    """
+    Send HTML email via Gmail SMTP. Requires:
+      - EMAIL_USER = your Gmail address
+      - EMAIL_PASSWORD = 16-char App Password (not your normal password)
+    Returns: {'sent': True} or {'sent': False, 'reason': '...'}
+    """
+    sender = os.environ.get('EMAIL_USER')
+    password = os.environ.get('EMAIL_PASSWORD')
+    if not sender or not password or not to_email:
+        return {'sent': False, 'reason': 'missing_email_config_or_to'}
 
-@app.get("/")
-def home():
-    return "<h2>AI4U Top 10 Backend is running!</h2>"
+    msg = EmailMessage()
+    msg['From'] = f"AI4U Top 10 <{sender}>"
+    msg['To'] = to_email
+    if bcc:
+        msg['Bcc'] = bcc
+    msg['Subject'] = subject
+    msg.set_content("HTML email. Please view with an HTML-capable client.")
+    msg.add_alternative(html_body, subtype='html')
 
-@app.get("/api/health")
-def health():
-    ok = bool(RAINFOREST_API_KEY)
-    return jsonify({"ok": ok})
+    # Prefer SSL 465; fallback to STARTTLS 587
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(sender, password)
+            server.send_message(msg)
+        return {'sent': True}
+    except Exception:
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.login(sender, password)
+                server.send_message(msg)
+            return {'sent': True}
+        except Exception as e2:
+            return {'sent': False, 'reason': f'{type(e2).__name__}: {e2}'}
 
-@app.post("/api/generate-list")
+def send_admin_lead(user_email: str, prompt: str) -> dict:
+    """Optional: notify ADMIN_EMAIL a lead was captured (best-effort)."""
+    sender = os.environ.get('EMAIL_USER')
+    password = os.environ.get('EMAIL_PASSWORD')
+    admin = os.environ.get('ADMIN_EMAIL') or None
+    if not sender or not password or not admin:
+        return {'sent': False, 'reason': 'missing_admin_or_auth'}
+
+    msg = EmailMessage()
+    msg['From'] = f"AI4U Top 10 <{sender}>"
+    msg['To'] = admin
+    msg['Subject'] = "Top 10 — New Lead Captured"
+    msg.set_content(
+        f"User Email: {user_email}\nSearch Query: {prompt}\nGenerated At: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(sender, password)
+            server.send_message(msg)
+        return {'sent': True}
+    except Exception:
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.login(sender, password)
+                server.send_message(msg)
+            return {'sent': True}
+        except Exception as e2:
+            return {'sent': False, 'reason': f'{type(e2).__name__}: {e2}'}
+
+# ---------- Rainforest API client ----------
+class RainforestApiClient:
+    def __init__(self, affiliate_id: str = "ai4u0c-20"):
+        self.affiliate_id = affiliate_id
+        self.api_key = os.environ.get('RAINFOREST_API_KEY')
+        if not self.api_key:
+            raise ValueError("Rainforest API key not found in environment variables")
+        self.base_url = "https://api.rainforestapi.com/request"
+
+    def search_products(self, search_term: str, max_results: int = 10):
+        params = {
+            "api_key": self.api_key,
+            "type": "search",
+            "amazon_domain": "amazon.com",
+            "search_term": search_term,
+            "sort_by": "featured",
+            "output": "json",
+        }
+        try:
+            resp = requests.get(self.base_url, params=params, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            if "search_results" not in data:
+                raise ValueError(f"Invalid response from Rainforest API: {data.get('message', 'No search_results')}")
+            products = []
+            for item in data["search_results"][:max_results]:
+                if not item.get("asin") or not item.get("title"):
+                    continue
+                asin = item.get("asin")
+                products.append({
+                    "asin": asin,
+                    "title": item.get("title"),
+                    "price": (item.get("price") or {}).get("raw", "Price not available"),
+                    "rating": item.get("rating", 0),
+                    "affiliate_link": f"https://www.amazon.com/dp/{asin}?tag={self.affiliate_id}",
+                    "image_url": item.get("image", ""),
+                    "description": item.get("title"),
+                    "amazon_url": f"https://www.amazon.com/dp/{asin}",
+                })
+            return products
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(f"Failed to connect to Rainforest API: {str(e)}")
+        except Exception as e:
+            raise
+
+# ---------- Product list generator ----------
+class ProductListGenerator:
+    def __init__(self):
+        self.api_client = RainforestApiClient()
+
+    def intelligent_category_analysis(self, prompt: str):
+        p = (prompt or "").lower()
+        if any(w in p for w in ['food', 'snack', 'chips', 'candy', 'coffee', 'tea', 'organic', 'grocery']):
+            return {'category': 'grocery', 'search_terms': f"{prompt} food"}
+        if any(w in p for w in ['baby', 'diaper', 'infant', 'toddler', 'kids', 'children']):
+            return {'category': 'baby', 'search_terms': f"{prompt} baby"}
+        if any(w in p for w in ['skincare', 'beauty', 'makeup', 'cosmetic', 'anti-aging']):
+            return {'category': 'beauty', 'search_terms': f"{prompt} beauty"}
+        if any(w in p for w in ['phone', 'smartphone', 'laptop', 'headphone', 'gaming']):
+            return {'category': 'electronics', 'search_terms': prompt}
+        return {'category': 'general', 'search_terms': prompt}
+
+    def generate_top10_list(self, prompt: str):
+        category_info = self.intelligent_category_analysis(prompt)
+        products = self.api_client.search_products(category_info['search_terms'], max_results=10)
+        if not products:
+            return {'success': False, 'error': f"No products found for '{prompt}'. Try a different term."}
+
+        products = products[:10]
+        list_title = f"Top 10 {prompt.title()} - AI-Researched & Endorsed 2025"
+        intro_text = (
+            f"Our AI analyzed {prompt.lower()} to produce this Top 10. "
+            "Selections weigh ratings, reviews, and overall value."
+        )
+        return {
+            'success': True,
+            'title': list_title,
+            'intro': intro_text,
+            'category': category_info['category'],
+            'products': products,
+            'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'affiliate_id': self.api_client.affiliate_id
+        }
+
+# ---------- API Routes ----------
+@app.route('/api/generate-list', methods=['POST'])
 def generate_list():
-    req_id = str(uuid.uuid4())[:8]
     try:
         data = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify({"success": False, "error": "Invalid JSON body"}), 400
+        prompt = (data.get('prompt') or '').strip()
+        user_email = (data.get('email') or '').strip()
 
-    prompt = (data.get("prompt") or "").strip()
-    user_email = (data.get("email") or "").strip()
+        if not prompt:
+            return jsonify({'success': False, 'error': 'Prompt is required'}), 400
 
-    if not prompt:
-        return jsonify({"success": False, "error": "Missing prompt"}), 400
+        generator = ProductListGenerator()
+        result = generator.generate_top10_list(prompt)
 
-    log.info("[%s] generate-list: q=%r email=%s", req_id, prompt, user_email or "-")
+        if result.get('success'):
+            # Generate a share URL ID (placeholder—implement persistence later if needed)
+            list_id = str(uuid.uuid4())[:8]
+            list_url = f"https://ai4u-top10-lists.vercel.app/list/{list_id}"
+            result['share_url'] = list_url
+            result['list_id'] = list_id
 
-    try:
-        products = rainforests_search(prompt)
+            # OPTIONAL: email the list if user provided an address (non-blocking UX)
+            if user_email and result.get('products'):
+                # Build a compact, mobile-friendly HTML
+                rows = []
+                for i, p in enumerate(result['products'], start=1):
+                    title_txt = p.get('title', 'Untitled')
+                    price = p.get('price', '')
+                    rating = p.get('rating', '')
+                    asin = p.get('asin', '')
+                    aff = _absolutize(p.get('affiliate_link') or p.get('amazon_url') or '#')
+                    img = p.get('image_url', '')
+                    rows.append(f"""
+                      <tr>
+                        <td style="padding:12px 0;border-bottom:1px solid #eee;">
+                          <div style="font-weight:600;">{i}. {title_txt}</div>
+                          <div style="font-size:13px;color:#666;">ASIN: {asin}</div>
+                          <div style="font-size:13px;color:#666;">Price: {price} &nbsp; • &nbsp; Rating: {rating}</div>
+                          <div style="margin:8px 0;">
+                            <a href="{aff}" style="display:inline-block;background:#6c47ff;color:#fff;text-decoration:none;padding:8px 14px;border-radius:8px;">View on Amazon</a>
+                          </div>
+                          {f'<img src="{img}" alt="" style="max-width:120px;border-radius:8px;">' if img else ''}
+                        </td>
+                      </tr>
+                    """)
+
+                html = f"""
+                <div style="font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial">
+                  <h2 style="margin:0 0 12px">{result.get('title','Your Top 10')}</h2>
+                  <p style="margin:0 0 16px;color:#444">Here’s your AI-researched Top 10 list.</p>
+                  <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
+                    {''.join(rows)}
+                  </table>
+                  <p style="margin-top:18px;color:#888;font-size:12px">
+                    Sent by AI4U Top 10. Links may include affiliate tags.
+                  </p>
+                </div>
+                """
+
+                result['email_status'] = send_email_html(
+                    to_email=user_email,
+                    subject=result.get('title', 'Your Top 10 List'),
+                    html_body=html,
+                    bcc=os.environ.get('ADMIN_EMAIL') or None
+                )
+                # Optional admin ping (best-effort; ignore failures)
+                _ = send_admin_lead(user_email, prompt)
+
+        return jsonify(result)
     except Exception as e:
-        log.error("[%s] rainforest error: %s", req_id, e)
-        return jsonify({"success": False, "error": f"Data provider error: {e}"}), 502
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-    title = f"Top 10 {prompt.title()} - AI-Researched & Endorsed 2025"
-    email_html = render_email_html(title, products)
-
-    # Optional email to user
-    sent = None
-    if user_email:
-        if not safe_email(user_email):
-            return jsonify({"success": False, "error": "Invalid email"}), 400
-        try:
-            sent = send_with_resend(user_email, title, email_html)
-            notify_admin_lead(prompt, user_email, req_id)
-        except Exception as e:
-            # Do not fail the whole request if email send has a temporary issue
-            log.warning("[%s] email send failed: %s", req_id, e)
-
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    has_rf = bool(os.environ.get('RAINFOREST_API_KEY'))
     return jsonify({
-        "success": True,
-        "title": title,
-        "affiliate_id": AFFILIATE_ID,
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "email": {"attempted": bool(user_email), "provider_response": sent},
-        "products": products,
+        'status': 'healthy' if has_rf else 'warning',
+        'message': 'AI4U Top 10 Lists API',
+        'rainforest_key': 'present' if has_rf else 'missing',
+        'affiliate_id': 'ai4u0c-20'
     })
 
-# Simple HTML preview (for debugging templates from a browser)
-@app.get("/api/preview-email")
-def preview_email():
-    q = request.args.get("q", "beer")
-    try:
-        products = rainforests_search(q)
-        html = render_email_html(f"Top 10 {q.title()} - Preview", products)
-        return html
-    except Exception as e:
-        return f"<pre>Error: {e}</pre>", 500
+@app.route('/', methods=['GET'])
+def home():
+    return "AI4U Top 10 Backend is running!"
 
-# Local dev
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.route('/test', methods=['GET'])
+def test_page():
+    # simple in-browser tester
+    return '''
+    <html>
+    <head><title>AI4U API Test</title></head>
+    <body style="font-family:Arial,sans-serif;max-width:800px;margin:0 auto;padding:20px">
+      <h1>AI4U Top 10 API Test</h1>
+      <label>Search Term:</label><br/>
+      <input id="prompt" value="vitamins" style="width:100%;padding:8px"/><br/><br/>
+      <label>Email (optional):</label><br/>
+      <input id="email" value="" style="width:100%;padding:8px"/><br/><br/>
+      <button onclick="go()" style="padding:10px 16px;background:#4CAF50;color:#fff;border:0;border-radius:6px">Test API</button>
+      <h2>Results:</h2>
+      <pre id="out" style="background:#f5f5f7;padding:12px;border-radius:8px;white-space:pre-wrap"></pre>
+      <script>
+        async function go(){
+          const out = document.getElementById('out');
+          out.textContent='Loading...';
+          try{
+            const r = await fetch('/api/generate-list', {
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({prompt: document.getElementById('prompt').value, email: document.getElementById('email').value})
+            });
+            const j = await r.json();
+            out.textContent = JSON.stringify(j,null,2);
+          }catch(e){ out.textContent='Error: '+e.message; }
+        }
+      </script>
+    </body>
+    </html>
+    '''
+
+# Vercel: module-level app is exported; this block runs only locally
+if __name__ == '__main__':
+    print("Starting AI4U Top 10 Backend")
+    print(f"Rainforest key configured: {'Yes' if os.environ.get('RAINFOREST_API_KEY') else 'No'}")
+    app.run(host='127.0.0.1', port=5000, debug=True)
